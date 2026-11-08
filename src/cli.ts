@@ -17,6 +17,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { access, chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -1834,7 +1835,19 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+function isMainModule(): boolean {
+  if (!process.argv[1]) return false;
+  const currentUrl = import.meta.url.toLowerCase();
+  try {
+    const realArgv1 = realpathSync(process.argv[1]);
+    if (pathToFileURL(realArgv1).href.toLowerCase() === currentUrl) return true;
+  } catch {
+    // realpath may fail if process.argv[1] is not a real path
+  }
+  return pathToFileURL(process.argv[1]).href.toLowerCase() === currentUrl;
+}
+
+if (isMainModule()) {
   void main().then((code) => {
     process.exitCode = code;
   });
