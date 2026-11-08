@@ -22,7 +22,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { pathToFileURL } from "node:url";
 
-const VERSION = "1.0.4";
+const VERSION = "2.0.0";
 const DEFAULT_BASE_URL = "https://designglyph.web.app";
 // The browser approval page is served by the site origin, which can differ
 // from the API host. Keep this small and explicit; never open an arbitrary
@@ -37,7 +37,7 @@ const TOKEN_KEY = "GLYPHPAY_TOKEN";
 const CALLBACK_SECRET_KEY = "GLYPHPAY_CALLBACK_SECRET";
 const WEBHOOK_PATH = "/api/glyphpay/webhook";
 const TOKEN_PATTERN = /^dgsvc_(test|live)_[A-Za-z0-9_-]{1,128}_[A-Za-z0-9_-]{43}$/;
-const CALLBACK_SECRET_PATTERN = /^dgcb_[A-Za-z0-9_-]{20,}$/;
+const CALLBACK_SECRET_PATTERN = /^whsec_[A-Za-z0-9+/]{20,}={0,2}$/;
 
 export class CliUsageError extends Error {
   constructor(message: string) {
@@ -70,6 +70,10 @@ export interface CliOptions {
   baseUrl?: string;
   /** How long to wait for browser approval. */
   timeoutSeconds?: number;
+  /** Connect: print pairing details as JSON, then exit without waiting. */
+  nonInteractive?: boolean;
+  /** Connect: finish a pairing started with `--non-interactive`. */
+  pollDeviceCode?: string;
   /** Machine-readable doctor output. */
   json?: boolean;
   /** Skip the interactive disconnect confirmation. */
@@ -99,6 +103,12 @@ export interface ConnectResult {
   environment: "test" | "live";
   callbackUrl: string | null;
   writtenTo: string | null;
+  /** Set when `--non-interactive` printed pairing details instead of waiting. */
+  pending?: boolean;
+  verificationUrl?: string;
+  userCode?: string;
+  deviceCode?: string;
+  nextCommand?: string;
 }
 
 export interface DisconnectResult {
@@ -238,6 +248,10 @@ export function parseArgs(argv: string[]): ParsedCommand {
       options.noOpen = true;
       continue;
     }
+    if (argument === "--non-interactive") {
+      options.nonInteractive = true;
+      continue;
+    }
     if (argument === "--json") {
       options.json = true;
       continue;
@@ -271,6 +285,17 @@ export function parseArgs(argv: string[]): ParsedCommand {
       } else {
         const [value, next] = takeValue(argv, index, flag);
         options.url = value;
+        index = next;
+      }
+      continue;
+    }
+    if (flag === "--poll") {
+      if (inlineValue !== undefined) {
+        if (!inlineValue) throw new CliUsageError("--poll needs a device code.");
+        options.pollDeviceCode = inlineValue;
+      } else {
+        const [value, next] = takeValue(argv, index, flag);
+        options.pollDeviceCode = value;
         index = next;
       }
       continue;
@@ -385,6 +410,8 @@ Connect / rotate
   --env <path>             Env file to update (default: ${DEFAULT_ENV_FILE})
   --print                  Print the credentials instead of writing a file
   --no-open                Do not open a browser automatically
+  --non-interactive        Print verification URL/code as JSON and exit
+  --poll <device-code>     Finish a pairing started with --non-interactive
   --base-url <url>         Glyph Pay API origin (default: ${DEFAULT_BASE_URL})
   --timeout <seconds>      Wait for approval (default: ${DEFAULT_TIMEOUT_SECONDS})
 
@@ -607,7 +634,7 @@ export function findPublicCredentialKeys(contents: string): string[] {
   const exposed: string[] = [];
   for (const line of contents.split(/\r?\n/)) {
     const match = /^\s*(?:export\s+)?((?:NEXT_PUBLIC_|VITE_|PUBLIC_)[A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(line);
-    if (match && /(?:dgsvc_|dgcb_|GLYPHPAY_(?:TOKEN|CALLBACK_SECRET))/.test(match[2])) {
+    if (match && /(?:dgsvc_|whsec_|GLYPHPAY_(?:TOKEN|CALLBACK_SECRET))/.test(match[2])) {
       exposed.push(match[1]);
     }
   }
@@ -759,40 +786,96 @@ async function waitForApproval(
 /* Connect and rotate                                                  */
 /* ------------------------------------------------------------------ */
 
+/** Quote one argument for the display-only `nextCommand`; the value is not executed. */
+function quoteCommandArg(value: string): string {
+  return /^[A-Za-z0-9_.\/:@\\-]+$/.test(value) ? value : `"${value.replace(/"/g, '\\"')}"`;
+}
+
 export async function runConnect(
   options: CliOptions = {},
   mode: "connect" | "rotate" = "connect"
 ): Promise<ConnectResult> {
   const baseUrl = baseUrlFor(options);
   const timeoutSeconds = options.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS;
+  if (mode === "rotate" && (options.nonInteractive || options.pollDeviceCode)) {
+    throw new CliUsageError("--non-interactive and --poll are only supported for connect.");
+  }
+  if (options.pollDeviceCode && options.url) {
+    throw new CliUsageError("--url cannot be used with --poll; the pairing already has its webhook.");
+  }
   const callbackUrl = options.url ? toCallbackUrl(options.url) : null;
 
-  const created = await api<CreatedDevice>(baseUrl, "/device", { callbackUrl });
-  if (!isSafeBrowserUrl(created.verificationUrl) || !isTrustedVerificationOrigin(created.verificationUrl, baseUrl)) {
-    throw new CliApiError(
-      0,
-      "invalid_verification_url",
-      "Glyph Pay returned a browser verification URL on a different origin. Refusing to open it."
-    );
-  }
-  const verificationUrl = new URL(created.verificationUrl).toString();
-  say();
-  say(style(1, mode === "rotate" ? "Glyph Pay - rotate credential" : "Glyph Pay - connect a site"));
-  say();
-  say(`1. Open ${style(4, sanitizeTerminal(verificationUrl))}`);
-  say(`2. Sign in and approve pairing code ${style(1, sanitizeTerminal(created.userCode))}.`);
-  say(`   The code expires at ${new Date(created.expiresAt).toLocaleTimeString()}.`);
-  if (options.noOpen) {
-    say("   (Browser opening skipped: --no-open.)");
-  } else if (openBrowser(verificationUrl)) {
-    say("   A browser window should open.");
-  } else {
-    say("   Could not open a browser. Open the link above manually.");
-  }
-  say();
-  say(mode === "rotate" ? "Waiting for approval (the previous token stays valid until then)..." : "Waiting for approval...");
+  let created: CreatedDevice | null = null;
+  if (!options.pollDeviceCode) {
+    created = await api<CreatedDevice>(baseUrl, "/device", { callbackUrl });
+    if (!isSafeBrowserUrl(created.verificationUrl) || !isTrustedVerificationOrigin(created.verificationUrl, baseUrl)) {
+      throw new CliApiError(
+        0,
+        "invalid_verification_url",
+        "Glyph Pay returned a browser verification URL on a different origin. Refusing to open it."
+      );
+    }
+    const verificationUrl = new URL(created.verificationUrl).toString();
 
-  const approved = await waitForApproval(baseUrl, created.deviceCode, created.interval, timeoutSeconds * 1000);
+    if (options.nonInteractive) {
+      const command = ["npx", "glyphpay", "connect", "--poll", created.deviceCode, "--base-url", baseUrl];
+      if (options.envFile) command.push("--env", options.envFile);
+      if (options.print) command.push("--print");
+      if (options.timeoutSeconds !== undefined) command.push("--timeout", String(options.timeoutSeconds));
+      const nextCommand = command.map(quoteCommandArg).join(" ");
+      say(
+        JSON.stringify(
+          {
+            verificationUrl,
+            userCode: created.userCode,
+            deviceCode: created.deviceCode,
+            expiresAt: created.expiresAt,
+            environment: created.environment,
+            nextCommand,
+          },
+          null,
+          2
+        )
+      );
+      return {
+        businessName: "",
+        environment: created.environment,
+        callbackUrl,
+        writtenTo: null,
+        pending: true,
+        verificationUrl,
+        userCode: created.userCode,
+        deviceCode: created.deviceCode,
+        nextCommand,
+      };
+    }
+
+    say();
+    say(style(1, mode === "rotate" ? "Glyph Pay - rotate credential" : "Glyph Pay - connect a site"));
+    say();
+    say(`1. Open ${style(4, sanitizeTerminal(verificationUrl))}`);
+    say(`2. Sign in and approve pairing code ${style(1, sanitizeTerminal(created.userCode))}.`);
+    say(`   The code expires at ${new Date(created.expiresAt).toLocaleTimeString()}.`);
+    if (options.noOpen) {
+      say("   (Browser opening skipped: --no-open.)");
+    } else if (openBrowser(verificationUrl)) {
+      say("   A browser window should open.");
+    } else {
+      say("   Could not open a browser. Open the link above manually.");
+    }
+    say();
+    say(mode === "rotate" ? "Waiting for approval (the previous token stays valid until then)..." : "Waiting for approval...");
+  } else {
+    say();
+    say("Waiting for approval...");
+  }
+
+  const approved = await waitForApproval(
+    baseUrl,
+    options.pollDeviceCode ?? created!.deviceCode,
+    options.pollDeviceCode ? 2 : created!.interval,
+    timeoutSeconds * 1000
+  );
 
   const tokenMode = TOKEN_PATTERN.exec(approved.token)?.[1];
   if (!tokenMode || tokenMode !== approved.environment) {
@@ -979,7 +1062,7 @@ function addDoctorCheck(report: DoctorReport, check: DoctorCheck, json: boolean)
   if (check.detail) say(`   ${sanitizeTerminal(check.detail)}`);
 }
 
-function signedTestEvent(secret: string, environment: "test" | "live"): { body: string; header: string; eventId: string } {
+function signedTestEvent(secret: string, environment: "test" | "live"): { body: string; eventId: string; timestamp: number } {
   const createdAt = new Date().toISOString();
   const eventId = `evt_test_${randomBytes(8).toString("hex")}`;
   const body = JSON.stringify({
@@ -1004,8 +1087,12 @@ function signedTestEvent(secret: string, environment: "test" | "live"): { body: 
     },
   });
   const timestamp = Math.floor(Date.now() / 1000);
-  const signature = createHmac("sha256", secret).update(`${timestamp}.${body}`).digest("hex");
-  return { body, header: `t=${timestamp},v1=${signature}`, eventId };
+  return { body, eventId, timestamp };
+}
+
+function standardWebhookSignature(secret: string, eventId: string, timestamp: number, body: string): string {
+  const key = Buffer.from(secret.slice(6), "base64");
+  return `v1,${createHmac("sha256", key).update(`${eventId}.${timestamp}.${body}`).digest("base64")}`;
 }
 
 async function deliverTestEvent(
@@ -1013,12 +1100,14 @@ async function deliverTestEvent(
   secret: string,
   environment: "test" | "live"
 ): Promise<{ status: number; ok: boolean; text: string }> {
-  const { body, header } = signedTestEvent(secret, environment);
+  const { body, eventId, timestamp } = signedTestEvent(secret, environment);
   const response = await fetch(callbackUrl, {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      "designglyph-signature": header,
+      "webhook-id": eventId,
+      "webhook-timestamp": String(timestamp),
+      "webhook-signature": standardWebhookSignature(secret, eventId, timestamp, body),
       "user-agent": `glyphpay-cli/${VERSION}`,
     },
     body,
@@ -1124,7 +1213,7 @@ export async function runDoctor(options: CliOptions = {}): Promise<DoctorReport>
   if (callbackSecret) {
     addDoctorCheck(
       report,
-      /^dgcb_[A-Za-z0-9_-]{20,}$/.test(callbackSecret)
+      CALLBACK_SECRET_PATTERN.test(callbackSecret)
         ? { id: "callback-secret-format", status: "ok", label: "Callback signing secret format is valid" }
         : { id: "callback-secret-format", status: "warn", label: "Callback signing secret has an unexpected format" },
       json

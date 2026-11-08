@@ -23,7 +23,7 @@ import {
 const CLI = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
 const DEFAULT_TOKEN = `dgsvc_test_biz_petal_${"a".repeat(43)}`;
 const NEXT_TOKEN = `dgsvc_test_biz_petal_${"b".repeat(43)}`;
-const CALLBACK_SECRET = `dgcb_${"c".repeat(40)}`;
+const CALLBACK_SECRET = `whsec_${"c".repeat(43)}=`;
 
 function runCli(args, cwd) {
   return new Promise((resolve) => {
@@ -53,6 +53,7 @@ async function withFakeApi(run, options = {}) {
   const verificationOverride = options.verificationUrl;
   let credentialCallbackUrl =
     options.callbackUrl === null ? null : options.callbackUrl ?? "https://shop.example.com/api/glyphpay/webhook";
+  const approvedCallbackSecret = options.approvedCallbackSecret ?? `whsec_${"d".repeat(43)}=`;
   let lastDeviceCallbackUrl = null;
   let nextToken = options.nextToken ?? NEXT_TOKEN;
 
@@ -193,7 +194,7 @@ async function withFakeApi(run, options = {}) {
         revoked = false;
         if (lastDeviceCallbackUrl) {
           credentialCallbackUrl = lastDeviceCallbackUrl;
-          callbackSecret = `dgcb_${"d".repeat(40)}`;
+          callbackSecret = approvedCallbackSecret;
         }
         res.end(
           JSON.stringify({
@@ -227,6 +228,7 @@ async function withFakeApi(run, options = {}) {
       getToken: () => tokenPayload,
       getRevoked: () => revoked,
       getCallbackSecret: () => callbackSecret,
+      getPolls: () => polls,
     });
   } finally {
     await new Promise((resolve) => server.close(resolve));
@@ -290,7 +292,7 @@ test("connect writes only the managed keys to an existing env file", async () =>
   assert.match(written, /^DATABASE_URL=postgres:\/\/local$/m);
   assert.match(written, /^OTHER=keep$/m);
   assert.match(written, new RegExp(`^GLYPHPAY_TOKEN=${NEXT_TOKEN}$`, "m"));
-  assert.match(written, new RegExp(`^GLYPHPAY_CALLBACK_SECRET=dgcb_${"d".repeat(40)}$`, "m"));
+  assert.match(written, new RegExp(`^GLYPHPAY_CALLBACK_SECRET=whsec_${"d".repeat(43)}=$`, "m"));
   assert.equal(written.match(/GLYPHPAY_TOKEN=/g)?.length, 1);
 });
 
@@ -304,6 +306,56 @@ test("--print leaves the filesystem alone and prints the credentials", async () 
   assert.match(outcome.stdout, new RegExp(`GLYPHPAY_TOKEN=${NEXT_TOKEN}`));
   assert.doesNotMatch(outcome.stdout, new RegExp(`GLYPHPAY_CALLBACK_SECRET=${CALLBACK_SECRET}`));
   await assert.rejects(readFile(join(directory, ".env.local"), "utf8"), /ENOENT/);
+});
+
+test("--non-interactive prints pairing JSON and exits without polling", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "glyphpay-cli-"));
+  const outcome = await withFakeApi(async ({ baseUrl, getPolls }) => {
+    const result = await runCli(["connect", "--non-interactive", "--base-url", baseUrl], directory);
+    return { result, polls: getPolls() };
+  });
+
+  assert.equal(outcome.result.code, 0, outcome.result.stderr);
+  const pairing = JSON.parse(outcome.result.stdout);
+  assert.match(pairing.verificationUrl, /\/cli\?code=ABCD-EFGH$/);
+  assert.equal(pairing.userCode, "ABCD-EFGH");
+  assert.match(pairing.deviceCode, /^device-/);
+  assert.equal(pairing.environment, "test");
+  assert.match(pairing.nextCommand, /connect --poll device-/);
+  assert.equal(outcome.polls, 0);
+  await assert.rejects(readFile(join(directory, ".env.local"), "utf8"), /ENOENT/);
+});
+
+test("--poll completes a pairing without creating a new device code", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "glyphpay-cli-"));
+  const outcome = await withFakeApi(async ({ baseUrl, requests }) => {
+    const result = await runCli(
+      ["connect", "--poll", `device-${"x".repeat(40)}`, "--print", "--base-url", baseUrl, "--timeout", "20"],
+      directory
+    );
+    return { result, requests };
+  });
+
+  assert.equal(outcome.result.code, 0, outcome.result.stderr);
+  assert.match(outcome.result.stdout, new RegExp(`GLYPHPAY_TOKEN=${NEXT_TOKEN}`));
+  assert.equal(outcome.requests.some((request) => request.path === "/api/cli/v1/device"), false);
+  assert.ok(outcome.requests.some((request) => request.path === "/api/cli/v1/device/token"));
+});
+
+test("connect accepts a whsec_ callback secret", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "glyphpay-cli-"));
+  const whsec = `whsec_${"e".repeat(43)}=`;
+  const outcome = await withFakeApi(
+    async ({ baseUrl }) =>
+      runCli(
+        ["connect", "--no-open", "--print", "--url", "https://shop.example.com", "--base-url", baseUrl, "--timeout", "20"],
+        directory
+      ),
+    { approvedCallbackSecret: whsec }
+  );
+
+  assert.equal(outcome.code, 0, outcome.stderr);
+  assert.match(outcome.stdout, new RegExp(`GLYPHPAY_CALLBACK_SECRET=${whsec}`));
 });
 
 test("doctor validates the token, Stripe readiness, and a signed test event", async () => {
@@ -325,9 +377,13 @@ test("doctor validates the token, Stripe readiness, and a signed test event", as
 
     const delivered = received.find((entry) => entry.method === "POST");
     assert.ok(delivered, "expected a POSTed test event");
-    const [t, v1] = delivered.headers["designglyph-signature"].split(",").map((part) => part.split("=")[1]);
-    const expected = createHmac("sha256", CALLBACK_SECRET).update(`${t}.${delivered.body}`).digest("hex");
-    assert.equal(v1, expected);
+    const [version, standard] = delivered.headers["webhook-signature"].split(",");
+    assert.equal(version, "v1");
+    const standardKey = Buffer.from(CALLBACK_SECRET.slice(6), "base64");
+    const expectedStandard = createHmac("sha256", standardKey)
+      .update(`${delivered.headers["webhook-id"]}.${delivered.headers["webhook-timestamp"]}.${delivered.body}`)
+      .digest("base64");
+    assert.equal(standard, expectedStandard);
     const event = JSON.parse(delivered.body);
     assert.equal(event.type, "webhook.test");
     assert.equal(event.data.orderId, "glyphpay-doctor");
@@ -419,7 +475,7 @@ test("rotate reuses the registered callback URL and writes the replacement token
   assert.equal(created.body.callbackUrl, "https://shop.example.com/api/glyphpay/webhook");
   const written = await readFile(envFile, "utf8");
   assert.match(written, new RegExp(`^GLYPHPAY_TOKEN=${NEXT_TOKEN}$`, "m"));
-  assert.match(written, new RegExp(`^GLYPHPAY_CALLBACK_SECRET=dgcb_${"d".repeat(40)}$`, "m"));
+  assert.match(written, new RegExp(`^GLYPHPAY_CALLBACK_SECRET=whsec_${"d".repeat(43)}=$`, "m"));
 });
 
 test("init scaffolds the Next.js App Router without touching unrelated env keys", async () => {

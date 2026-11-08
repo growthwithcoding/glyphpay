@@ -37,8 +37,26 @@ export interface GlyphPayOptions {
    * the order update.
    */
   seen?: (eventId: string) => Promise<boolean> | boolean;
-  /** Runs once per verified callback. Delivery is at-least-once, so dedupe on `event.id`. Throw to have it retried. */
+  /**
+   * Catch-all handler for verified callbacks. A named `onPayment*` handler,
+   * when provided, takes precedence for that event type. Delivery is
+   * at-least-once, so dedupe on `event.id`. Throw to have it retried.
+   */
   onEvent?: (event: GlyphPayEvent) => Promise<void> | void;
+  /** Runs for `payment.succeeded`; falls back to `onEvent` when omitted. */
+  onPaymentSucceeded?: (event: Extract<GlyphPayEvent, { type: "payment.succeeded" }>) => Promise<void> | void;
+  /** Runs for `payment.failed`; falls back to `onEvent` when omitted. */
+  onPaymentFailed?: (event: Extract<GlyphPayEvent, { type: "payment.failed" }>) => Promise<void> | void;
+  /** Runs for `payment.processing`; falls back to `onEvent` when omitted. */
+  onPaymentProcessing?: (event: Extract<GlyphPayEvent, { type: "payment.processing" }>) => Promise<void> | void;
+  /** Runs for `payment.canceled`; falls back to `onEvent` when omitted. */
+  onPaymentCanceled?: (event: Extract<GlyphPayEvent, { type: "payment.canceled" }>) => Promise<void> | void;
+  /** Runs for `payment.refund_updated`; falls back to `onEvent` when omitted. */
+  onPaymentRefundUpdated?: (event: Extract<GlyphPayEvent, { type: "payment.refund_updated" }>) => Promise<void> | void;
+  /** Runs for `payment.dispute_updated`; falls back to `onEvent` when omitted. */
+  onPaymentDisputeUpdated?: (event: Extract<GlyphPayEvent, { type: "payment.dispute_updated" }>) => Promise<void> | void;
+  /** Runs for `payment.updated`; falls back to `onEvent` when omitted. */
+  onPaymentUpdated?: (event: Extract<GlyphPayEvent, { type: "payment.updated" }>) => Promise<void> | void;
 }
 
 export interface Order { orderId: string; amountCents: number; description: string }
@@ -64,13 +82,26 @@ export interface Payment {
 
 export interface Refund { paymentId: string; refundId: string; amountCents: number; status: string }
 
-export interface GlyphPayEvent {
+export type GlyphPayEventType =
+  | "payment.succeeded"
+  | "payment.failed"
+  | "payment.processing"
+  | "payment.canceled"
+  | "payment.refund_updated"
+  | "payment.dispute_updated"
+  | "payment.updated"
+  | "webhook.test";
+
+interface GlyphPayEventBase {
   id: string;
-  type: "payment.succeeded" | "payment.failed" | "payment.processing" | "payment.canceled" | "payment.refund_updated" | "payment.dispute_updated";
   createdAt: string;
   livemode: boolean;
   data: Payment;
 }
+
+export type GlyphPayEvent = {
+  [K in GlyphPayEventType]: GlyphPayEventBase & { type: K };
+}[GlyphPayEventType];
 
 /** Error from the GlyphPay API (status/message are the API's). */
 export class GlyphPayError extends Error {
@@ -185,23 +216,65 @@ function checkoutOriginAllowed(req: Request, allowed: string[]): boolean {
   }
 }
 
-interface SignatureHeader {
-  timestamp: string | null;
-  signatures: string[];
+const EVENT_TYPES = new Set<GlyphPayEventType>([
+  "payment.succeeded",
+  "payment.failed",
+  "payment.processing",
+  "payment.canceled",
+  "payment.refund_updated",
+  "payment.dispute_updated",
+  "payment.updated",
+  "webhook.test",
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** Parse `t=…,v1=…,v1=…` without object keys, so header values cannot pollute prototypes. */
-function parseSignatureHeader(header: string | null): SignatureHeader {
-  const result: SignatureHeader = { timestamp: null, signatures: [] };
-  for (const raw of (header ?? "").split(",")) {
-    const index = raw.indexOf("=");
-    if (index < 1) continue;
-    const key = raw.slice(0, index).trim();
-    const value = raw.slice(index + 1).trim();
-    if (key === "t" && result.timestamp === null) result.timestamp = value;
-    if (key === "v1") result.signatures.push(value);
+/**
+ * Shape check after signature verification. A malformed body is a permanent
+ * 400 (the signature proved it came from GlyphPay, so retrying cannot fix it);
+ * `livemode` is checked separately so a backend serializer bug still retries.
+ */
+function isValidEventPayload(event: unknown): event is GlyphPayEvent {
+  if (!isRecord(event)) return false;
+  if (typeof event.id !== "string" || event.id.length === 0) return false;
+  if (typeof event.type !== "string" || !EVENT_TYPES.has(event.type as GlyphPayEventType)) return false;
+  if (typeof event.createdAt !== "string" || event.createdAt.length === 0) return false;
+  if (typeof event.livemode !== "boolean") return false;
+  if (!isRecord(event.data)) return false;
+  if (event.type !== "webhook.test" && (typeof event.data.orderId !== "string" || event.data.orderId.length === 0)) {
+    return false;
   }
-  return result;
+  return true;
+}
+
+/** Named handlers win for their own event type; `onEvent` is the fallback. */
+async function dispatchEvent(options: GlyphPayOptions, event: GlyphPayEvent): Promise<void> {
+  switch (event.type) {
+    case "payment.succeeded":
+      if (options.onPaymentSucceeded) { await options.onPaymentSucceeded(event); return; }
+      break;
+    case "payment.failed":
+      if (options.onPaymentFailed) { await options.onPaymentFailed(event); return; }
+      break;
+    case "payment.processing":
+      if (options.onPaymentProcessing) { await options.onPaymentProcessing(event); return; }
+      break;
+    case "payment.canceled":
+      if (options.onPaymentCanceled) { await options.onPaymentCanceled(event); return; }
+      break;
+    case "payment.refund_updated":
+      if (options.onPaymentRefundUpdated) { await options.onPaymentRefundUpdated(event); return; }
+      break;
+    case "payment.dispute_updated":
+      if (options.onPaymentDisputeUpdated) { await options.onPaymentDisputeUpdated(event); return; }
+      break;
+    case "payment.updated":
+      if (options.onPaymentUpdated) { await options.onPaymentUpdated(event); return; }
+      break;
+  }
+  await options.onEvent?.(event);
 }
 
 export function glyphPay(options: GlyphPayOptions) {
@@ -286,10 +359,11 @@ export function glyphPay(options: GlyphPayOptions) {
       }
       let event: GlyphPayEvent;
       try {
-        event = await verifyCallback(rawBody, req.headers.get("designglyph-signature"), options.callbackSecret);
+        event = await verifyCallback(rawBody, req.headers, options.callbackSecret);
       } catch {
         return new Response("Invalid signature", { status: 400 });
       }
+      if (!isRecord(event)) return new Response("Invalid event payload", { status: 400 });
       const tokenMode = /^dgsvc_(test|live)_/.exec(options.token ?? "")?.[1];
       if (!tokenMode) return new Response("GlyphPay token not configured", { status: 500 });
       // A missing/non-boolean mode is a malformed event, not proof of forgery.
@@ -300,9 +374,10 @@ export function glyphPay(options: GlyphPayOptions) {
       if (event.livemode !== (tokenMode === "live")) {
         return new Response("Event mode does not match this credential", { status: 400 });
       }
+      if (!isValidEventPayload(event)) return new Response("Invalid event payload", { status: 400 });
       try {
         if (options.seen && (await options.seen(event.id))) return new Response(null, { status: 204 });
-        await options.onEvent?.(event);
+        await dispatchEvent(options, event);
       } catch (error) {
         console.error(`GlyphPay event ${event.id} handler failed:`, error instanceof Error ? error.message : error);
         return new Response("Handler failed", { status: 500 });
@@ -312,32 +387,78 @@ export function glyphPay(options: GlyphPayOptions) {
   };
 }
 
-/**
- * Verifies `Designglyph-Signature: t=<unix>,v1=<hex HMAC-SHA256(secret, "t.body")>`.
- * Multiple `v1` values are accepted so a secret can be rotated with an overlap.
- * Rejects >5 min skew and returns the parsed event.
- */
-export async function verifyCallback(rawBody: string, header: string | null, secret: string): Promise<GlyphPayEvent> {
-  if (!secret) throw new GlyphPayError(400, "Invalid GlyphPay signature.");
-  const { timestamp, signatures } = parseSignatureHeader(header);
-  const timestampNumber = Number(timestamp);
-  const fresh = typeof timestamp === "string" && /^\d{1,12}$/.test(timestamp) &&
-    Math.abs(Date.now() / 1000 - timestampNumber) <= 300;
-  const validHex = signatures.filter((signature) => /^[0-9a-f]{64}$/.test(signature));
-  if (!fresh || validHex.length === 0) throw new GlyphPayError(400, "Invalid GlyphPay signature.");
+function base64ToBytes(value: string): Uint8Array<ArrayBuffer> {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
 
+/** Standard Webhooks key: the decoded `whsec_` bytes. */
+function secretKeyBytes(secret: string): Uint8Array<ArrayBuffer> | null {
+  if (!secret.startsWith("whsec_")) return null;
+  try {
+    const decoded = base64ToBytes(secret.slice(6));
+    return decoded.length > 0 ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseEvent(rawBody: string): GlyphPayEvent {
+  try {
+    return JSON.parse(rawBody) as GlyphPayEvent;
+  } catch {
+    throw new GlyphPayError(400, "Invalid GlyphPay payload.");
+  }
+}
+
+async function verifyStandardSignature(rawBody: string, headers: Headers, secret: string): Promise<GlyphPayEvent | null> {
+  const id = headers.get("webhook-id");
+  const timestamp = headers.get("webhook-timestamp");
+  const signatureHeader = headers.get("webhook-signature");
+  if (!id || !timestamp || !signatureHeader) return null;
+  if (!/^\d{1,12}$/.test(timestamp)) return null;
+  if (Math.abs(Date.now() / 1000 - Number(timestamp)) > 300) return null;
+
+  const signatures = signatureHeader
+    .split(/\s+/)
+    .map((part) => {
+      const [version, value] = part.split(",", 2);
+      return version === "v1" && value && /^[A-Za-z0-9+/]+={0,2}$/.test(value) ? value : null;
+    })
+    .filter((value): value is string => value !== null);
+  if (signatures.length === 0) return null;
+
+  const keyBytes = secretKeyBytes(secret);
+  if (!keyBytes) return null;
   const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
-  const signed = enc.encode(`${timestamp}.${rawBody}`);
-  let matched = false;
-  for (const signature of validHex) {
-    const bytes = Uint8Array.from(signature.match(/../g)!, (hex) => parseInt(hex, 16));
+  const key = await crypto.subtle.importKey("raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+  const signed = enc.encode(`${id}.${timestamp}.${rawBody}`);
+  for (const signature of signatures) {
+    let bytes: Uint8Array<ArrayBuffer>;
+    try {
+      bytes = base64ToBytes(signature);
+    } catch {
+      continue;
+    }
     // subtle.verify compares in constant time.
     if (await crypto.subtle.verify("HMAC", key, bytes, signed)) {
-      matched = true;
-      break;
+      const event = parseEvent(rawBody);
+      if (event.id !== id) throw new GlyphPayError(400, "Invalid GlyphPay signature.");
+      return event;
     }
   }
-  if (!matched) throw new GlyphPayError(400, "Invalid GlyphPay signature.");
-  return JSON.parse(rawBody) as GlyphPayEvent;
+  return null;
+}
+
+/**
+ * Verifies a Standard Webhooks callback (`webhook-id`, `webhook-timestamp`,
+ * `webhook-signature`) against a `whsec_` secret. Rejects >5 min skew.
+ */
+export async function verifyCallback(rawBody: string, headers: Headers, secret: string): Promise<GlyphPayEvent> {
+  if (!secret || !secret.startsWith("whsec_")) throw new GlyphPayError(400, "Invalid GlyphPay signature.");
+  const event = await verifyStandardSignature(rawBody, headers, secret);
+  if (!event) throw new GlyphPayError(400, "Invalid GlyphPay signature.");
+  return event;
 }

@@ -35,12 +35,13 @@ The command opens Glyph Pay in your browser. Sign in as the client's billing ema
 
 ```sh
 GLYPHPAY_TOKEN=dgsvc_test_...
-GLYPHPAY_CALLBACK_SECRET=dgcb_...
+GLYPHPAY_CALLBACK_SECRET=whsec_...
 ```
 
 - `--url <site>` registers `<site>/api/glyphpay/webhook`. Pass a full URL to use a different route.
 - `--env <path>` targets another env file; `--print` prints the values instead of writing.
 - `--no-open`, `--base-url` and `--timeout` help scripts and local testing.
+- `--non-interactive` prints the verification URL, user code, device code, expiry, and a `--poll` command as JSON, then exits. Run that command on the same machine to wait for approval and write the credential.
 - Codes expire after ten minutes. Approving again rotates the token: the previous token stops working immediately.
 - Pairing is disabled while the platform is in live mode.
 - **Only approve a code you generated in your own terminal.** Glyph Pay never calls, emails, or messages you to approve a pairing code. Check the webhook domain before approving; approval rotates the credential and can replace the old webhook.
@@ -151,6 +152,8 @@ export const glyphpay = glyphPay({
 });
 ```
 
+Named hooks take precedence over `onEvent` for their event type: `onPaymentSucceeded`, `onPaymentFailed`, `onPaymentProcessing`, `onPaymentCanceled`, `onPaymentRefundUpdated`, `onPaymentDisputeUpdated`, and `onPaymentUpdated`. Use `onEvent` for the rest or to handle everything in one place.
+
 `app/api/glyphpay/checkout/route.ts`
 
 ```ts
@@ -185,7 +188,15 @@ export const glyphpay = glyphPay({
 
 Add a bot challenge (for example Turnstile) after repeated failures, and enable Stripe Radar rules on every connected account. If a proxy rewrites the public origin, pass the site origin in `allowedCheckoutOrigins`.
 
-The webhook route caps bodies at 1 MB, accepts multiple `v1` signatures during secret rotation, and rejects a `livemode` that disagrees with the credential. A missing or non-boolean `livemode` returns 500 so the delivery is retried; `seen` is consulted as a fast path only, and `onEvent` dedupes durably with an atomic insert on `event.id`.
+The webhook route caps bodies at 1 MB, accepts multiple `v1` signatures during secret rotation, and rejects a `livemode` that disagrees with the credential. A missing or non-boolean `livemode` returns 500 so the delivery is retried. After verification it validates the event shape (`id`, `type`, `createdAt`, and `data.orderId` for payment events) and returns 400 before `seen` or any handler runs; `webhook.test` events may omit `orderId`. `seen` is consulted as a fast path only, and `onEvent` dedupes durably with an atomic insert on `event.id`.
+
+### Webhook signatures
+
+The webhook route accepts Standard Webhooks only:
+
+- `webhook-id`, `webhook-timestamp`, and `webhook-signature: v1,<base64 HMAC-SHA256(key, "id.timestamp.body")>`.
+
+Callback credentials are `whsec_` base64 secrets, so the HMAC key is the decoded secret bytes. `verifyCallback(rawBody, req.headers, secret)` verifies the request headers; the route handler does this automatically. The route accepts multiple space-separated `v1` signatures during rotation.
 
 Checkout page:
 
@@ -228,5 +239,5 @@ await glyphpay.refund(paymentId, { idempotencyKey: `${orderId}-refund-1` });
 ## Develop
 
 ```sh
-npm install && npm test
+cd packages/glyphpay && npm install && npm test
 ```
