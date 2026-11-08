@@ -1,0 +1,67 @@
+name: Publish glyphpay
+
+# Manual release only. npm trusted publishing uses GitHub OIDC; no npm token is
+# stored in this repository. Configure the trusted publisher on npmjs.com with:
+#   repository: growthwithcoding/glyphpay
+#   workflow:   publish.yml
+#   environment: npm
+# The npm account/org must also require 2FA and have a second owner.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact version in package.json (for example 1.0.3)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Do not set registry-url here. setup-node writes an empty
+      # //registry.npmjs.org/:_authToken entry when no NODE_AUTH_TOKEN exists,
+      # which makes npm skip the OIDC exchange. npm defaults to the public
+      # registry, so trusted publishing needs no .npmrc token.
+      - run: npm ci
+      - run: npm test
+      - run: npm run release:check
+
+      - name: Verify the requested version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          ACTUAL_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$ACTUAL_VERSION" != "$REQUESTED_VERSION" ]; then
+            echo "package.json is $ACTUAL_VERSION, not $REQUESTED_VERSION" >&2
+            exit 1
+          fi
+
+      # npm records the checked-out commit as gitHead. A dirty tree means the
+      # published files differ from any commit, which is how every release up
+      # to 1.0.2 ended up pointing at the same commit.
+      - name: Verify the release is built from a clean commit
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Refusing to publish from a dirty working tree. Commit the release first." >&2
+            git status --porcelain
+            exit 1
+          fi
+          echo "Publishing from commit $(git rev-parse HEAD)"
+
+      # Trusted publishing (OIDC) needs npm 11.5.1 or newer.
+      - run: npm install --global npm@latest
+
+      - run: npm pack --dry-run
+      - run: npm publish --provenance --access public
