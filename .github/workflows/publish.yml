@@ -64,5 +64,12 @@ jobs:
       - run: npm install --global npm@latest
 
       - run: npm pack --dry-run
-      - run: npm publish --provenance --access public
+      - name: Publish to npm (staged or direct)
+        run: |
+          if npm stage publish --provenance; then
+            echo "Release staged successfully. Approve the release on npmjs.com under Staged Packages."
+          else
+            echo "npm stage publish exited with code $?, falling back to direct publish..."
+            npm publish --provenance --access public
+          fi
 
