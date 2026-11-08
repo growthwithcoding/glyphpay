@@ -175,6 +175,20 @@ test("checkout route prices server-side, sends the credential only to GlyphPay, 
   assert.equal(limitedResponse.headers.get("retry-after"), "30");
   assert.equal((await limitedResponse.json()).error, "Slow down.");
 
+  const limitedWithOptions = glyphPay({
+    token: "dgsvc_test_biz_secret",
+    beforeCheckout: () => { throw new RateLimitError({ message: "Try again later.", retryAfterSeconds: 15 }); },
+    priceOrder: () => ({ orderId: "cart-42", amountCents: 2500, description: "Order" }),
+  });
+  const optionsResponse = await limitedWithOptions.checkout(new Request("https://site/api/glyphpay/checkout", {
+    method: "POST",
+    body: JSON.stringify({ cartId: "42" }),
+    headers: { "content-type": "application/json" },
+  }));
+  assert.equal(optionsResponse.status, 429);
+  assert.equal(optionsResponse.headers.get("retry-after"), "15");
+  assert.equal((await optionsResponse.json()).error, "Try again later.");
+
   t.mock.method(globalThis, "fetch", async () => Response.json({ ok: false, error: { message: "Connected account is not ready" } }, { status: 409 }));
   const down = await post({ cartId: "42" });
   assert.equal(down.status, 502);

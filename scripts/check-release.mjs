@@ -77,3 +77,4 @@ if (errors.length > 0) {
 }
 
 console.log(`release check passed: ${pkg.name}@${version}`);
+

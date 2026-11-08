@@ -1,6 +1,6 @@
 {
   "name": "glyphpay",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Drop-in GlyphPay checkout for websites, with a CLI for setup, diagnostics, and credential lifecycle.",
   "homepage": "https://glyphpay.net",
   "repository": {

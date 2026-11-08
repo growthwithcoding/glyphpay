@@ -21,7 +21,7 @@ The CLI covers setup, diagnostics, and credential lifecycle:
 
 ## 1.0 compatibility
 
-`glyphpay` 1.x follows Semantic Versioning. The documented package exports and the `/api/client/v1` and `/api/cli/v1` HTTP contracts accept additive changes only; ignore unknown response fields and event types. Breaking changes ship under a new API version with an overlap period. A breaking change ships under a new API version with an overlap period.
+`glyphpay` 1.x follows Semantic Versioning. The documented package exports and the `/api/client/v1` and `/api/cli/v1` HTTP contracts accept additive changes only; ignore unknown response fields and event types. Breaking changes ship under a new API version with an overlap period.
 
 The CLI supports **Node 18+**. The server connector (`glyphpay/server`) uses `fetch` and Web Crypto and targets **Node 20+**, Next.js, edge runtimes, and Cloudflare Workers. A 1.0 release is a code and contract milestone: live payments remain gated by sandbox acceptance, deployment verification, and written approval.
 
@@ -89,7 +89,7 @@ The command detects the project framework from `package.json`. It creates a serv
 - **Astro** — `src/pages/api/glyphpay/*.ts`; use server/SSR output and an adapter.
 - **Remix** — `app/routes/api.glyphpay.*.ts` with `app/lib/glyphpay.server.ts`.
 - **Hono** — `src/glyphpay-routes.ts`; mount it with `app.route("/api/glyphpay", glyphpayRoutes)`.
-- **Express** — `src/glyphpay-routes.ts`; mount it with `app.use("/api/glyphpay", glyphpayRoutes)`. The webhook route uses `express.raw` so signatures verify against the original bytes. The adapter reads `X-Forwarded-Proto` and `X-Forwarded-Host`; set `app.set("trust proxy", 1)` when TLS ends at a proxy.
+- **Express** — `src/glyphpay-routes.ts`; mount it with `app.use("/api/glyphpay", glyphpayRoutes)`. The webhook route uses `express.raw` so signatures verify against the original bytes. The adapter honors `X-Forwarded-Proto`/`X-Forwarded-Host` only when `app.set("trust proxy", 1)` is enabled, so set it when TLS ends at a proxy; otherwise `Origin` checks fail closed.
 
 It refuses to overwrite existing files unless you pass `--force`; use `--dry-run` to preview. Then run `glyphpay connect` and wire `priceOrder()` and `onEvent()` to your order database.
 
@@ -165,7 +165,7 @@ import { glyphpay } from "@/lib/glyphpay";
 export const POST = glyphpay.webhook;
 ```
 
-The checkout route requires `application/json`, checks the request `Origin`, caps the body at 1 MB, and calls `beforeCheckout(req)` when you provide it. Throw `RateLimitError` from that hook for HTTP 429 with `retry-after` and no-store:
+The checkout route requires `application/json`, checks the request `Origin`, caps the body at 1 MB, and calls `beforeCheckout(req)` when you provide it. Throw `RateLimitError` from that hook for HTTP 429 with `retry-after` and no-store. `message` is shown to the shopper; the constructor also accepts `(message, retryAfterSeconds)`:
 
 ```ts
 import { RateLimitError } from "glyphpay/server";
@@ -177,7 +177,7 @@ export const glyphpay = glyphPay({
     // is not enough: every instance would start with a fresh limit.
     const key = `${clientIp(req)}:${await sessionId(req)}`;
     if (!(await limiter.hit(key, { limit: 20, windowSeconds: 60 }))) {
-      throw new RateLimitError({ retryAfterSeconds: 30 });
+      throw new RateLimitError({ message: "Too many attempts. Try again shortly.", retryAfterSeconds: 30 });
     }
   },
 });
@@ -210,7 +210,7 @@ Without React:
 </script>
 ```
 
-The route handlers take a standard `Request` and return a `Response`, so the same two lines work in Remix, Astro, Hono, SvelteKit, and Cloudflare Workers. In Express, `glyphpay init` generates a small adapter that preserves the raw webhook body and builds the public request URL from `X-Forwarded-Proto`/`X-Forwarded-Host`; behind a TLS-terminating proxy also set `app.set("trust proxy", 1)`.
+The route handlers take a standard `Request` and return a `Response`, so the same two lines work in Remix, Astro, Hono, SvelteKit, and Cloudflare Workers. In Express, `glyphpay init` generates a small adapter that preserves the raw webhook body and builds the public request URL from `req.protocol` and `Host`, honoring `X-Forwarded-Proto`/`X-Forwarded-Host` only when `app.set("trust proxy", 1)` is enabled; set that behind a TLS-terminating proxy.
 
 ## How a payment flows
 

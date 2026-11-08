@@ -80,11 +80,32 @@ export class GlyphPayError extends Error {
 /** Throw from `priceOrder` or `beforeCheckout` to send `message` to the shopper with a 400. */
 export class CheckoutError extends Error {}
 
-/** Throw from `beforeCheckout` to tell the shopper to retry later; returns HTTP 429. */
+/** Options for `RateLimitError`; `message` is shown to the shopper. */
+export interface RateLimitErrorOptions {
+  message?: string;
+  retryAfterSeconds?: number;
+}
+
+/**
+ * Throw from `beforeCheckout` to tell the shopper to retry later; returns HTTP 429.
+ * Accepts `(message, retryAfterSeconds)` or `{ message, retryAfterSeconds }`.
+ */
 export class RateLimitError extends Error {
-  constructor(message = "Too many checkout attempts. Please try again shortly.", public retryAfterSeconds = 60) {
-    super(message);
+  public retryAfterSeconds: number;
+
+  constructor(
+    messageOrOptions: string | RateLimitErrorOptions = "Too many checkout attempts. Please try again shortly.",
+    retryAfterSeconds = 60
+  ) {
+    const options = typeof messageOrOptions === "object" && messageOrOptions !== null ? messageOrOptions : undefined;
+    super(
+      options?.message ??
+        (typeof messageOrOptions === "string"
+          ? messageOrOptions
+          : "Too many checkout attempts. Please try again shortly.")
+    );
     this.name = "RateLimitError";
+    this.retryAfterSeconds = options?.retryAfterSeconds ?? retryAfterSeconds;
   }
 }
 

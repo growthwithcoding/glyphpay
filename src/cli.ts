@@ -22,7 +22,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { pathToFileURL } from "node:url";
 
-const VERSION = "1.0.3";
+const VERSION = "1.0.4";
 const DEFAULT_BASE_URL = "https://designglyph.web.app";
 // The browser approval page is served by the site origin, which can differ
 // from the API host. Keep this small and explicit; never open an arbitrary
@@ -1498,14 +1498,13 @@ function honoRoutes(): string {
 }
 
 function expressRoutes(isTs: boolean): string {
-  const headerHelper = `function firstHeader(value${isTs ? ": string | string[] | undefined" : ""}) {\n  const first = Array.isArray(value) ? value[0] : value;\n  return first ? first.split(",")[0].trim() : undefined;\n}\n\n`;
   const typeImport = isTs
     ? `import type { Request as ExpressRequest, Response as ExpressResponse } from "express";\n`
     : "";
   const signature = isTs ? ": ExpressRequest" : "";
   const responseType = isTs ? ": ExpressResponse" : "";
   const handlerType = isTs ? "(request: Request) => Promise<Response>" : "handler";
-  return `import express from "express";\nimport { glyphpay } from "./lib/glyphpay";\n${typeImport}\nexport const glyphpayRoutes = express.Router();\n\n${headerHelper}async function adapt(handler${isTs ? `: ${handlerType}` : ""}, req${signature}, res${responseType}) {\n  const body =\n    req.method === "GET" || req.method === "HEAD"\n      ? undefined\n      : Buffer.isBuffer(req.body)\n        ? req.body\n        : typeof req.body === "string"\n          ? req.body\n          : JSON.stringify(req.body ?? {});\n  const protocol = firstHeader(req.headers["x-forwarded-proto"]) || req.protocol || "http";\n  const host = firstHeader(req.headers["x-forwarded-host"]) || req.get("host") || "localhost";\n  const request = new Request(\`\${protocol}://\${host}\${req.originalUrl}\`, {\n    method: req.method,\n    headers: req.headers as unknown as HeadersInit,\n    body,\n  });\n  const response = await handler(request);\n  res.status(response.status);\n  response.headers.forEach((value, key) => res.setHeader(key, value));\n  res.send(Buffer.from(await response.arrayBuffer()));\n}\n\nglyphpayRoutes.post("/checkout", express.json(), (req, res) => adapt(glyphpay.checkout, req, res));\nglyphpayRoutes.post("/webhook", express.raw({ type: "application/json" }), (req, res) => adapt(glyphpay.webhook, req, res));\n`;
+  return `import express from "express";\nimport { glyphpay } from "./lib/glyphpay";\n${typeImport}\nexport const glyphpayRoutes = express.Router();\n\nfunction publicOrigin(req${signature}) {\n  const forwardedHost = req.app.get("trust proxy") ? req.get("x-forwarded-host") : undefined;\n  const host = (forwardedHost ? forwardedHost.split(",")[0].trim() : "") || req.get("host") || "localhost";\n  return \`\${req.protocol || "http"}://\${host}\`;\n}\n\nasync function adapt(handler${isTs ? `: ${handlerType}` : ""}, req${signature}, res${responseType}) {\n  const body =\n    req.method === "GET" || req.method === "HEAD"\n      ? undefined\n      : Buffer.isBuffer(req.body)\n        ? req.body\n        : typeof req.body === "string"\n          ? req.body\n          : JSON.stringify(req.body ?? {});\n  const request = new Request(\`\${publicOrigin(req)}\${req.originalUrl}\`, {\n    method: req.method,\n    headers: req.headers as unknown as HeadersInit,\n    body,\n  });\n  const response = await handler(request);\n  res.status(response.status);\n  response.headers.forEach((value, key) => res.setHeader(key, value));\n  res.send(Buffer.from(await response.arrayBuffer()));\n}\n\nglyphpayRoutes.post("/checkout", express.json(), (req, res) => adapt(glyphpay.checkout, req, res));\nglyphpayRoutes.post("/webhook", express.raw({ type: "application/json" }), (req, res) => adapt(glyphpay.webhook, req, res));\n`;
 }
 
 async function frameworkPlan(projectRoot: string, framework: Framework): Promise<FrameworkPlan> {
@@ -1611,7 +1610,7 @@ async function frameworkPlan(projectRoot: string, framework: Framework): Promise
     notes: [
       "Mount the router with app.use(\"/api/glyphpay\", glyphpayRoutes).",
       "The webhook route uses express.raw so the signature is verified against the original bytes.",
-      "Behind a TLS proxy, set app.set(\"trust proxy\", 1) so Express reports the public https origin; the adapter also reads X-Forwarded-Proto and X-Forwarded-Host.",
+      "Behind a TLS proxy, set app.set(\"trust proxy\", 1): the adapter reads X-Forwarded-Proto and X-Forwarded-Host only when trust proxy is enabled, and Origin checks fail closed otherwise.",
       "If the public site origin differs from the internal request origin, add it to allowedCheckoutOrigins when constructing glyphPay().",
     ],
   };

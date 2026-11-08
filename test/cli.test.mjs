@@ -560,8 +560,11 @@ test("init detects Remix, Astro, SvelteKit, Hono, and Express", async () => {
     const route = await readFile(join(project, ...entry.file), "utf8");
     assert.match(route, entry.pattern, `${entry.name} route`);
     if (entry.name === "express") {
-      assert.match(route, /x-forwarded-proto/);
-      assert.match(route, /x-forwarded-host/);
+      assert.match(route, /publicOrigin/);
+      assert.match(route, /trust proxy/);
+      assert.match(route, /req\.get\("x-forwarded-host"\)/);
+      assert.doesNotMatch(route, /firstHeader/);
+      assert.doesNotMatch(route, /req\.headers\["x-forwarded-proto"\]/);
     }
     const lib = await readFile(join(project, ...entry.lib), "utf8");
     assert.match(lib, /glyphPay\(/, `${entry.name} connector`);
