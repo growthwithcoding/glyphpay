@@ -294,6 +294,113 @@ test("checkout route prices server-side, sends the credential only to GlyphPay, 
   assert.doesNotMatch((await down.json()).error, /Connected account/);
 });
 
+test("checkout forwards the rail that priceOrder selected", async (t) => {
+  const calls = [];
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    calls.push({ url, body: init.body ? JSON.parse(init.body) : null });
+    return Response.json({
+      ok: true,
+      data: {
+        id: "p_crypto",
+        paymentIntentId: "pi_crypto",
+        clientSecret: "cs_crypto",
+        publishableKey: "pk_1",
+        stripeAccount: "acct_1",
+        amountCents: 10000,
+        chargedCents: 10162,
+        processingFeeCents: 162,
+        paymentMethod: "crypto",
+      },
+    });
+  });
+
+  const gp = glyphPay({
+    token: "dgsvc_test_biz_secret",
+    priceOrder: (body) => {
+      const rail = body?.paymentMethod === "crypto" ? "crypto" : "card";
+      return {
+        orderId: `cart-${body.cartId}-${rail}`,
+        amountCents: 10000,
+        description: "Order",
+        paymentMethod: rail,
+      };
+    },
+  });
+
+  const response = await gp.checkout(new Request("https://site/api/glyphpay/checkout", {
+    method: "POST",
+    body: JSON.stringify({ cartId: "42", paymentMethod: "crypto" }),
+    headers: { "content-type": "application/json" },
+  }));
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    clientSecret: "cs_crypto",
+    publishableKey: "pk_1",
+    stripeAccount: "acct_1",
+    paymentId: "p_crypto",
+  });
+  assert.deepEqual(calls[0].body, {
+    orderId: "cart-42-crypto",
+    amountCents: 10000,
+    description: "Order",
+    paymentMethod: "crypto",
+    currency: "usd",
+  });
+});
+
+test("passes the crypto rail through quote and payment creation", async (t) => {
+  const calls = [];
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    calls.push({ url, body: init.body ? JSON.parse(init.body) : null });
+    if (String(url).endsWith("/payments/quote")) {
+      return Response.json({
+        ok: true,
+        data: {
+          amountCents: 10000,
+          currency: "usd",
+          card: { chargedCents: 10649, processingFeeCents: 649 },
+          us_bank_account: null,
+          crypto: { chargedCents: 10162, processingFeeCents: 162 },
+        },
+      });
+    }
+    return Response.json({
+      ok: true,
+      data: {
+        id: "p1",
+        paymentIntentId: "pi_1",
+        clientSecret: "cs_1",
+        publishableKey: "pk_1",
+        stripeAccount: "acct_1",
+        amountCents: 10000,
+        chargedCents: 10162,
+        processingFeeCents: 162,
+        paymentMethod: "crypto",
+      },
+    });
+  });
+
+  const gp = glyphPay({ token: "dgsvc_test_biz_secret" });
+  const quote = await gp.quote(10000);
+  // A quoted crypto total is a real price at the flat 1.5%; null means hidden.
+  assert.deepEqual(quote.crypto, { chargedCents: 10162, processingFeeCents: 162 });
+
+  const created = await gp.createPayment({
+    orderId: "order-crypto",
+    amountCents: 10000,
+    description: "Order",
+    paymentMethod: "crypto",
+  });
+  assert.equal(created.paymentMethod, "crypto");
+  assert.deepEqual(calls[1].body, {
+    orderId: "order-crypto",
+    amountCents: 10000,
+    description: "Order",
+    paymentMethod: "crypto",
+    currency: "usd",
+  });
+});
+
 test("base URL must be HTTPS outside loopback and must not contain credentials", () => {
   assert.throws(() => glyphPay({ token: "dgsvc_test_x", baseUrl: "http://api.example.com" }), /https/);
   assert.throws(() => glyphPay({ token: "dgsvc_test_x", baseUrl: "https://user:pass@api.example.com" }), /credentials/);

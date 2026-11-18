@@ -31,7 +31,7 @@ The CLI supports **Node 18+**. The server connector (`glyphpay/server`) uses `fe
 npx glyphpay connect --url https://client-site.com
 ```
 
-The command opens Glyph Pay in your browser. Sign in as the client's billing email (or a Design Glyph admin), pick the client account, confirm the webhook URL and approve the pairing code. The terminal receives a test service credential and, when a webhook URL was registered, its signing secret. It writes both to `.env.local`:
+The command opens Glyph Pay in your browser. Sign in as the client's billing email (or a Design Glyph admin), pick the client account, confirm the webhook URL and approve the pairing code. The terminal receives a test service credential and, when a webhook URL was registered, its signing secret. It writes both to the site's own env file: the CLI scans the project root for `.env`, `.env.local`, `.env.development.local` and friends, preferring a file that already holds a Glyph Pay key. When several candidates exist it asks which file to use; without a terminal it uses the first match and prints the choice.
 
 ```sh
 GLYPHPAY_TOKEN=dgsvc_test_...
@@ -40,6 +40,7 @@ GLYPHPAY_CALLBACK_SECRET=whsec_...
 
 - `--url <site>` registers `<site>/api/glyphpay/webhook`. Pass a full URL to use a different route.
 - `--env <path>` targets another env file; `--print` prints the values instead of writing.
+- After writing, `connect` appends `GLYPHPAY_TOKEN=` and `GLYPHPAY_CALLBACK_SECRET=` placeholders to the matching example file (`.env.example`, `.env.local.example`, `.env.sample`, or `.env.template`, created if missing) and adds the credential file to the nearest `.gitignore`. Existing values and unrelated lines are preserved, and `.env.example` stays unignored.
 - `--no-open`, `--base-url` and `--timeout` help scripts and local testing.
 - `--non-interactive` prints the verification URL, user code, device code, expiry, and a `--poll` command as JSON, then exits. Run that command on the same machine to wait for approval and write the credential.
 - Codes expire after ten minutes. Approving again rotates the token: the previous token stops working immediately.
@@ -93,6 +94,58 @@ The command detects the project framework from `package.json`. It creates a serv
 - **Express** — `src/glyphpay-routes.ts`; mount it with `app.use("/api/glyphpay", glyphpayRoutes)`. The webhook route uses `express.raw` so signatures verify against the original bytes. The adapter honors `X-Forwarded-Proto`/`X-Forwarded-Host` only when `app.set("trust proxy", 1)` is enabled, so set it when TLS ends at a proxy; otherwise `Origin` checks fail closed.
 
 It refuses to overwrite existing files unless you pass `--force`; use `--dry-run` to preview. Then run `glyphpay connect` and wire `priceOrder()` and `onEvent()` to your order database.
+
+## Typed setup: Firebase Functions + Firestore invoices
+
+`setup` is the deployment-aware version of `init`. It detects the frontend separately from the backend target, then generates the server integration where it can actually run:
+
+```sh
+npx glyphpay setup \
+  --target firebase-functions \
+  --preset firestore-invoices \
+  --ui react
+```
+
+If the project is a static Next.js export (`output: "export"`), `setup --target next` fails with an explanation instead of writing route handlers that can never run. Supported targets are `firebase-functions`, `next`, `remix`, `astro`, `sveltekit`, `hono`, and `express`; `--preset custom` keeps the generic `init` scaffold.
+
+For Firebase Functions, `setup`:
+
+- writes `functions/src/glyphpay/config.ts`: explicit invoice collection and field mappings, disjoint status groups, the authorization policy, and a pure `applyInvoicePayment`;
+- writes `functions/src/glyphpay/functions.ts`: `defineSecret("GLYPHPAY_TOKEN")`, `defineSecret("GLYPHPAY_CALLBACK_SECRET")`, `createFirebaseHttpsHandler`, and an authorized `status` route;
+- appends one export to the existing Functions entry point (`index.ts`) and adds `glyphpay` to the Functions and site packages;
+- adds only the checkout, webhook and status Hosting rewrites, ahead of catch-alls. Unrelated rewrites, redirects and headers are preserved, and an existing `/api/glyphpay{,/**}` rewrite to the same function is reused;
+- writes a small React `InvoicePayment` wrapper around `GlyphPayCheckout` that never reads `window` while rendering;
+- writes `functions/.env.example` placeholders only, never secret values.
+
+Use `--dry-run` and `--json` to preview, `--force` to replace generated files you edited, `--functions-dir`, `--function-id`, `--region` and `--checkout-path`/`--webhook-path`/`--status-path` for layout. A differing generated file is a hard error without `--force`, and an existing exact rewrite owned by another function is always an error: setup never shadows another route.
+
+The generated config still starts in a safe, broken state: `assertConfigured()` refuses to boot until `CONFIGURED` is `true` and the collection, field names and status groups are reviewed. `authorize` is required because the Admin SDK bypasses Firestore Security Rules; a server lookup is not authorization.
+
+### Invoice adapter
+
+`glyphpay/firebase` exports `createFirestoreInvoiceAdapter`, `asFirestoreLike`, and the adapter types. The adapter supplies `priceOrder`, `onEvent`, `status`, `applyVerifiedPayment`, `orderIdFor` and `revisionFor`:
+
+- the browser sends only `{ invoiceId }` (or a custom reference); pricing always comes from the invoice document;
+- unrelated field names are never inferred: `outstandingCents`, `description`, `status`, `currency`, `businessId` and `environment` are explicit, and a status may belong to only one of `payable`, `paid`, `void`, `processing`;
+- a payment attempt is identified by `gp1.<invoiceId>.<revision>`, where the default revision hashes the outstanding balance, currency and description, so a changed balance produces a new order instead of charging a stale amount;
+- the durable business ledger is one document per PaymentIntent (`payments`), delivery identity is one document per callback id (`deliveries`), and `applyPayment` runs inside the transaction, may be re-run, and must stay free of email/HTTP/entitlement calls;
+- duplicate deliveries, different event ids for the same payment, out-of-order events, environment/currency/amount/order mismatches, and `webhook.test` diagnostics are handled before the invoice is touched. Late success on a void or paid invoice is recorded as `unapplied` and never credited;
+- refunds and disputes are recorded as facts; they do not re-credit the invoice or re-run fulfillment. Optional fulfillment outbox rows and `onApplied` hooks run only after commit.
+
+### Payment-link capabilities
+
+`glyphpay/capability` exports `createPaymentLinkCapability` and `verifyPaymentLinkCapability`: an HMAC-SHA256 token (`gpcap.<payload>.<sig>`) bound to an invoice id, optional immutable revision and expiry, with a minimum 32-byte secret and constant-time verification. Mint it on the server when an authorized user requests a link; verify it in the adapter's `authorize` before pricing or serving status. The capability replaces a session, it does not replace business authorization.
+
+### Firebase secrets
+
+`glyphpay connect` writes local development values (the detected env file, or `--env <path>`). Those are not production secrets. Production values belong in Secret Manager:
+
+```sh
+firebase functions:secrets:set GLYPHPAY_TOKEN
+firebase functions:secrets:set GLYPHPAY_CALLBACK_SECRET
+```
+
+Uploading secrets, pairing approval, deployment and live activation are separate, explicitly approved actions.
 
 ## Manual setup: connect the client in Design Glyph admin
 
@@ -222,6 +275,64 @@ Without React:
 ```
 
 The route handlers take a standard `Request` and return a `Response`, so the same two lines work in Remix, Astro, Hono, SvelteKit, and Cloudflare Workers. In Express, `glyphpay init` generates a small adapter that preserves the raw webhook body and builds the public request URL from `req.protocol` and `Host`, honoring `X-Forwarded-Proto`/`X-Forwarded-Host` only when `app.set("trust proxy", 1)` is enabled; set that behind a TLS-terminating proxy.
+
+## Crypto (stablecoin) payments
+
+`quote()` returns the crypto total, or `null` when the rail is unavailable:
+
+```ts
+const quote = await glyphpay.quote(cart.totalCents);
+if (!quote.crypto) {
+  // Offer card or bank only.
+}
+```
+
+When it is quoted, let the shopper choose it and pass that rail through your
+order. The browser's order object is opaque to the package, so naming the rail
+there is enough for `priceOrder` to price and return it:
+
+```tsx
+// Checkout page: render this only when quote.crypto is non-null.
+<GlyphPayCheckout
+  order={{ cartId, paymentMethod: "crypto" }}
+  returnUrl={`/thank-you?cart=${cartId}`}
+/>
+```
+
+```ts
+// Site server: the rail comes from the browser, the amount never does.
+async priceOrder(body) {
+  const rail = (body as { paymentMethod?: PaymentMethod }).paymentMethod === "crypto" ? "crypto" : "card";
+  if (rail === "crypto" && cart.totalCents > 1_000_000) {
+    throw new CheckoutError("Crypto payments are capped at $10,000.");
+  }
+  return {
+    orderId: `${cart.id}-v${cart.version}-${rail}`,
+    amountCents: cart.totalCents,
+    description: `Order ${cart.id}`,
+    paymentMethod: rail,
+  };
+}
+```
+
+`orderId` includes the rail so a shopper switching from card to crypto gets a
+new payment instead of the card intent. Import `type PaymentMethod` from
+`glyphpay/server` for the union. With `glyphpay/firebase`, the generated
+`priceOrder` reads `paymentMethod` from the order body, defaults to card, and
+adds its own rail-specific order id, so the adapter is ready for this without a
+custom pricing function.
+
+- The customer pays in USDC, and Stripe sends them to its own crypto page and
+  back to `returnUrl`. **The redirect is not proof of payment** - keep verifying
+  through the webhook or `getPayment()`.
+- The payment settles in USD, so amounts, webhooks, refunds and the callback
+  body keep the same shape as a card payment.
+- Processing is a flat 1.5% with no fixed fee, and the customer is capped at USD
+  10,000 per transaction. Do not offer the rail above that total.
+- There are no chargebacks. A refund is returned as stablecoin to the wallet that
+  paid, so tell customers to keep access to that wallet.
+- Availability is per deployment **and** per merchant account. Call `quote()`
+  instead of assuming the rail exists.
 
 ## How a payment flows
 

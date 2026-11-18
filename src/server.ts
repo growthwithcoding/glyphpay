@@ -59,9 +59,54 @@ export interface GlyphPayOptions {
   onPaymentUpdated?: (event: Extract<GlyphPayEvent, { type: "payment.updated" }>) => Promise<void> | void;
 }
 
-export interface Order { orderId: string; amountCents: number; description: string }
+/** Every rail a payment can be created on. `crypto` settles in USD. */
+export type PaymentMethod = "card" | "us_bank_account" | "crypto";
 
-export interface CheckoutSession { id: string; paymentIntentId: string; clientSecret: string; publishableKey: string; stripeAccount: string }
+/** One rail's price: the order plus the grossed-up recovery of its fee. */
+export interface RailQuote {
+  chargedCents: number;
+  processingFeeCents: number;
+}
+
+export interface Order {
+  orderId: string;
+  amountCents: number;
+  description: string;
+  /**
+   * `card` (default), `us_bank_account` when ACH is enabled, or `crypto` when
+   * the deployment offers stablecoin payments. Chooses the priced total, and the
+   * PaymentIntent is restricted to that one rail.
+   */
+  paymentMethod?: PaymentMethod;
+}
+
+export interface CheckoutSession {
+  id: string;
+  paymentIntentId: string;
+  clientSecret: string;
+  publishableKey: string;
+  stripeAccount: string;
+  amountCents: number;
+  /** What the shopper is charged: the order plus one merchant processing fee. */
+  chargedCents: number;
+  processingFeeCents: number;
+  paymentMethod: PaymentMethod;
+}
+
+/** Every rail's totals for an order, before anything is created. */
+export interface Quote {
+  amountCents: number;
+  currency: "usd";
+  card: RailQuote;
+  /** Null when bank payments are not enabled for the deployment. */
+  us_bank_account: RailQuote | null;
+  /**
+   * Null unless stablecoin payments are offered to this merchant. Fixed at 1.5%
+   * and capped at USD 10,000 per transaction by the processor, so the total is a
+   * genuinely different price rather than the card total relabelled.
+   */
+  crypto: RailQuote | null;
+}
 
 export type PaymentStatus = "creating" | "requires_payment_method" | "processing" | "succeeded" | "canceled" | "failed";
 
@@ -69,7 +114,10 @@ export interface Payment {
   id: string;
   orderId: string;
   status: PaymentStatus;
+  paymentMethod: PaymentMethod;
   amountCents: number;
+  chargedCents: number;
+  processingFeeCents: number;
   applicationFeeCents: number;
   currency: "usd";
   refundedCents: number;
@@ -108,8 +156,20 @@ export class GlyphPayError extends Error {
   constructor(public status: number, message: string) { super(message); }
 }
 
-/** Throw from `priceOrder` or `beforeCheckout` to send `message` to the shopper with a 400. */
-export class CheckoutError extends Error {}
+/**
+ * Throw from `priceOrder`, `beforeCheckout`, or an invoice adapter's
+ * `authorize` to send `message` to the shopper. Defaults to HTTP 400; pass
+ * 401/403 for a failed authorization, or 404 when the reference is unknown.
+ */
+export class CheckoutError extends Error {
+  public status: number;
+
+  constructor(message: string, status = 400) {
+    super(message);
+    this.name = "CheckoutError";
+    this.status = status;
+  }
+}
 
 /** Options for `RateLimitError`; `message` is shown to the shopper. */
 export interface RateLimitErrorOptions {
@@ -298,6 +358,8 @@ export function glyphPay(options: GlyphPayOptions) {
   const api = {
     /** Idempotent per orderId: calling again returns the same payment. */
     createPayment: (order: Order) => call<CheckoutSession>("POST", "/payments", { ...order, currency: "usd" }),
+    /** Every rail's totals for an order. Creates nothing; safe to call while rendering checkout. */
+    quote: (amountCents: number) => call<Quote>("POST", "/payments/quote", { amountCents }),
     getPayment: (paymentId: string) => call<Payment>("GET", `/payments/${id(paymentId)}`),
     /** Omit amountCents to refund the remaining balance. Reusing an idempotencyKey replays the same refund. */
     refund: (paymentId: string, input: { idempotencyKey: string; amountCents?: number }) => call<Refund>("POST", `/payments/${id(paymentId)}/refunds`, input),
@@ -337,7 +399,10 @@ export function glyphPay(options: GlyphPayOptions) {
             }
           );
         }
-        if (error instanceof CheckoutError) return Response.json({ error: error.message }, { status: 400 });
+        if (error instanceof CheckoutError) {
+          const status = Number.isInteger(error.status) && error.status >= 400 && error.status <= 499 ? error.status : 400;
+          return Response.json({ error: error.message }, { status, headers: { "cache-control": "no-store" } });
+        }
         if (error instanceof GlyphPayError && error.status === 413) {
           return Response.json({ error: "Checkout request is too large." }, { status: 413 });
         }

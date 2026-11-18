@@ -1,12 +1,20 @@
 /**
  * GlyphPay connector, browser half. Framework-free: works on any site.
  * Talks only to the site's own checkout route; the service credential never reaches the browser.
+ *
+ * Crypto (stablecoin) is a redirect method: Stripe sends the shopper to its
+ * hosted crypto page and back to `returnUrl`, so a return is navigation, never
+ * proof of payment. Card and bank payments stay inside the Payment Element.
  */
 import { loadStripe, type Appearance } from "@stripe/stripe-js";
 import { resolveReturnUrl } from "./security.js";
 
 export interface CheckoutOptions {
-  /** JSON posted to your checkout route, e.g. `{ cartId }`. Your server prices it; never send a trusted amount. */
+  /**
+   * JSON posted to your checkout route, e.g. `{ cartId }`. Your server prices
+   * it; never send a trusted amount. Include the shopper's rail here (for
+   * example `{ cartId, paymentMethod: "crypto" }`) when `priceOrder` prices it.
+   */
   order: unknown;
   /** Where Stripe sends the shopper after paying. Must stay on this site unless `allowCrossOriginReturn` is set. */
   returnUrl: string;
@@ -17,6 +25,12 @@ export interface CheckoutOptions {
   /** Stripe Elements appearance (theme, colors, fonts). */
   appearance?: Appearance;
   buttonText?: string;
+  /**
+   * Add headers to the checkout request, e.g. a fresh Firebase ID token for a
+   * signed-in payer. Called on every attempt; never put a service credential
+   * here. This is additive and optional.
+   */
+  authorize?: () => Promise<Record<string, string>> | Record<string, string>;
 }
 
 /**
@@ -38,9 +52,14 @@ export function mountCheckout(container: HTMLElement, options: CheckoutOptions):
   container.append(form);
 
   (async () => {
+    const extraHeaders = options.authorize ? await options.authorize() : {};
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    for (const [name, value] of Object.entries(extraHeaders ?? {})) {
+      if (typeof value === "string" && value) headers[name] = value;
+    }
     const res = await fetch(options.endpoint ?? "/api/glyphpay/checkout", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers,
       body: JSON.stringify(options.order ?? null),
     });
     const session = await res.json().catch(() => ({}));

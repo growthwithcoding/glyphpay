@@ -9,6 +9,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   ensureEnvKeys,
+  ensureGitignoreEntries,
   findPublicCredentialKeys,
   isProbeableCallbackUrl,
   isPublicHttpsUrl,
@@ -691,4 +692,80 @@ test("upsertEnv rejects newline injection and invalid keys", () => {
 test("sanitizeTerminal removes ANSI escapes and control characters", () => {
   assert.equal(sanitizeTerminal("\u001b[31mred\u001b[0m\nnext"), "red next");
   assert.doesNotMatch(sanitizeTerminal("ok\u001b]0;title\u0007"), /\u001b/);
+});
+
+test("connect writes to an existing .env, documents the keys, and gitignores the file", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "glyphpay-envdetect-"));
+  await writeFile(join(directory, ".env"), "DATABASE_URL=postgres://local\n", "utf8");
+  await writeFile(join(directory, ".gitignore"), "node_modules/\n", "utf8");
+
+  const outcome = await withFakeApi(async ({ baseUrl }) =>
+    runCli(
+      ["connect", "--no-open", "--url", "https://shop.example.com", "--base-url", baseUrl, "--timeout", "20"],
+      directory
+    )
+  );
+
+  assert.equal(outcome.code, 0, outcome.stdout + outcome.stderr);
+  const env = await readFile(join(directory, ".env"), "utf8");
+  assert.match(env, /^DATABASE_URL=postgres:\/\/local$/m);
+  assert.match(env, new RegExp(`^GLYPHPAY_TOKEN=${NEXT_TOKEN}$`, "m"));
+  await assert.rejects(readFile(join(directory, ".env.local"), "utf8"), /ENOENT/);
+
+  const example = await readFile(join(directory, ".env.example"), "utf8");
+  assert.match(example, /^GLYPHPAY_TOKEN=$/m);
+  assert.match(example, /^GLYPHPAY_CALLBACK_SECRET=$/m);
+  assert.match(outcome.stdout, /placeholders to \.env\.example/);
+
+  const gitignore = await readFile(join(directory, ".gitignore"), "utf8");
+  assert.match(gitignore, /^node_modules\/$/m);
+  assert.match(gitignore, /^\.env$/m);
+  assert.match(outcome.stdout, /Added \.env to \.gitignore/);
+});
+
+test("connect reuses the env file that already holds a Glyph Pay key", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "glyphpay-envdetect-reuse-"));
+  await writeFile(join(directory, ".env.local"), "OTHER=keep\n", "utf8");
+  await writeFile(join(directory, ".env"), `GLYPHPAY_TOKEN=${DEFAULT_TOKEN}\n`, "utf8");
+
+  const outcome = await withFakeApi(async ({ baseUrl }) =>
+    runCli(
+      ["connect", "--no-open", "--url", "https://shop.example.com", "--base-url", baseUrl, "--timeout", "20"],
+      directory
+    )
+  );
+
+  assert.equal(outcome.code, 0, outcome.stdout + outcome.stderr);
+  assert.match(await readFile(join(directory, ".env"), "utf8"), new RegExp(`^GLYPHPAY_TOKEN=${NEXT_TOKEN}$`, "m"));
+  assert.doesNotMatch(await readFile(join(directory, ".env.local"), "utf8"), /GLYPHPAY_TOKEN/);
+  assert.match(outcome.stderr, /found multiple env files/);
+  assert.match(await readFile(join(directory, ".gitignore"), "utf8"), /^\.env$/m);
+});
+
+test("ensureGitignoreEntries adds rules once and keeps the example file committed", () => {
+  const first = ensureGitignoreEntries("node_modules/\n", [".env.local"], [".env.example"]);
+  assert.equal(first, "node_modules/\n\n# Glyph Pay - service credentials. Never commit this file.\n.env.local\n");
+  assert.equal(ensureGitignoreEntries(first, [".env.local"], [".env.example"]), first);
+
+  const broad = ensureGitignoreEntries(".env*\n", [".env.local"], [".env.example"]);
+  assert.match(broad, /^!\.env\.example$/m);
+  assert.doesNotMatch(broad, /^\.env\.local$/m);
+
+  assert.match(ensureGitignoreEntries("", ["functions/.env"]), /^functions\/\.env$/m);
+});
+
+test("--env resolves inside --dir, not the shell's cwd", async () => {
+  const shell = await mkdtemp(join(tmpdir(), "glyphpay-dir-cwd-"));
+  const site = await mkdtemp(join(tmpdir(), "glyphpay-dir-site-"));
+
+  const outcome = await withFakeApi(async ({ baseUrl }) =>
+    runCli(
+      ["connect", "--no-open", "--url", "https://shop.example.com", "--base-url", baseUrl, "--timeout", "20", "--dir", site, "--env", ".env"],
+      shell
+    )
+  );
+
+  assert.equal(outcome.code, 0, outcome.stdout + outcome.stderr);
+  assert.match(await readFile(join(site, ".env"), "utf8"), new RegExp(`^GLYPHPAY_TOKEN=${NEXT_TOKEN}$`, "m"));
+  await assert.rejects(readFile(join(shell, ".env"), "utf8"), /ENOENT/);
 });
